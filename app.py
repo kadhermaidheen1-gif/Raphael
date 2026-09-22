@@ -107,14 +107,19 @@ def detect_website_intent(text: str):
     return None
 
 def detect_load_intent(text: str):
-    """Detect 'load the chat X' / 'load chat X' patterns and return the identifier."""
+    """Detect load/restore/show patterns and return the identifier."""
     t = text.lower().strip()
     for prefix in ("load the chat ", "load chat ", "load my chat ",
-                   "restore chat ", "restore the chat "):
+                   "restore chat ", "restore the chat ", "open the chat ",
+                   "open my chat ", "show the chat "):
         if t.startswith(prefix):
             identifier = text[len(prefix):].strip().strip("'\"")
             if identifier:
                 return identifier
+    if t in ("show it fully", "show me the full chat", "show the full chat",
+             "show it all", "load it", "load it fully", "show full",
+             "show me the full conversation"):
+        return "__LAST__"
     return None
 
 # ---------- Long-term memory ----------
@@ -564,6 +569,21 @@ async def process_message(message: cl.Message):
         return
 
     load_id = detect_load_intent(message.content)
+    if load_id == "__LAST__":
+        if supabase:
+            try:
+                recent = supabase.table("saved_chats").select("id").order("created_at", desc=True).limit(1).execute()
+                if recent.data:
+                    load_id = str(recent.data[0]["id"])
+                    print(f"[DEBUG] Resolved __LAST__ to chat id {load_id}")
+                else:
+                    load_id = None
+            except Exception as e:
+                print(f"[DEBUG] Failed to find recent chat: {e}")
+                load_id = None
+        else:
+            load_id = None
+
     if load_id:
         print(f"[DEBUG] Pre-routed load_chat: {load_id}")
         result = load_saved_chat(load_id)
