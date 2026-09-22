@@ -4,3 +4,4 @@ ddgs
 requests
 python-dotenv
 gTTS
+supabase
