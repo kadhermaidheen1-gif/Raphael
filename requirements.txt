@@ -1,5 +1,5 @@
-chainlit==2.11.0
-groq==0.11.1
+chainlit
+groq
 ddgs
 requests
 python-dotenv
