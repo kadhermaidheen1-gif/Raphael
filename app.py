@@ -109,17 +109,27 @@ def detect_website_intent(text: str):
 def detect_load_intent(text: str):
     """Detect load/restore/show patterns and return the identifier."""
     t = text.lower().strip()
+
+    # Strip common leading words the user might add
+    for prefix in ("hey raphael ", "raphael ", "hey ", "please ", "pls "):
+        if t.startswith(prefix):
+            t = t[len(prefix):].strip()
+
+    # Explicit load commands with an identifier
     for prefix in ("load the chat ", "load chat ", "load my chat ",
                    "restore chat ", "restore the chat ", "open the chat ",
                    "open my chat ", "show the chat "):
         if t.startswith(prefix):
-            identifier = text[len(prefix):].strip().strip("'\"")
+            identifier = t[len(prefix):].strip().strip("'\"")
             if identifier:
                 return identifier
+
+    # Standalone generic phrases
     if t in ("show it fully", "show me the full chat", "show the full chat",
              "show it all", "load it", "load it fully", "show full",
              "show me the full conversation"):
         return "__LAST__"
+
     return None
 
 # ---------- Long-term memory ----------
