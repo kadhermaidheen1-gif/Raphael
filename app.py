@@ -11,6 +11,7 @@ from chainlit.element import CustomElement
 from groq import AsyncGroq, Groq as SyncGroq
 from ddgs import DDGS
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
 load_dotenv()
 
@@ -20,6 +21,10 @@ HISTORY_FILE = "chat_history.json"
 LONG_TERM_FILE = "long_term_memory.json"
 DEFAULT_CITY = "Coimbatore"
 IS_WINDOWS = platform.system() == "Windows"
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 SYSTEM_PROMPT = """You are Raphael, Lord of Wisdom, an ultimate skill analytical AI assistant.
 Address the user as 'Master'.
@@ -40,6 +45,13 @@ Environment note: open_app, open_website, take_screenshot, and get_battery
 only work on the user's local Windows computer. If these tools return a
 message saying they're not available, tell the user honestly instead of
 pretending the action succeeded.
+
+Chat history tools (READ CAREFULLY — do not confuse these):
+- save_chat: STORES the current chat. Triggered by "save this chat as X".
+- list_chats: LISTS all saved chats. Triggered by "show my saved chats".
+- search_chats: SEARCHES saved chats by keyword. Triggered by "search my chats for X".
+- load_chat: RETRIEVES a saved chat and restores it. Triggered by "load the chat X", "load chat X", "open my saved chat X".
+NEVER use save_chat when the user says "load". "Load" always means load_chat.
 """
 
 # ---------- File helpers ----------
@@ -92,6 +104,17 @@ def detect_website_intent(text: str):
     for site, url in KNOWN_SITES.items():
         if site in t:
             return url
+    return None
+
+def detect_load_intent(text: str):
+    """Detect 'load the chat X' / 'load chat X' patterns and return the identifier."""
+    t = text.lower().strip()
+    for prefix in ("load the chat ", "load chat ", "load my chat ",
+                   "restore chat ", "restore the chat "):
+        if t.startswith(prefix):
+            identifier = text[len(prefix):].strip().strip("'\"")
+            if identifier:
+                return identifier
     return None
 
 # ---------- Long-term memory ----------
@@ -175,6 +198,100 @@ async def speak(text: str):
         print(f"[DEBUG] TTS failed: {e}")
 
 # ================================================================
+#                    SAVED CHAT (SUPABASE)
+# ================================================================
+
+def save_chat_to_cloud(name: str, history: list) -> str:
+    if supabase is None:
+        return "Cloud storage is not configured."
+    facts = load_long_term()
+    clean_history = [m for m in history if m.get("role") != "system"]
+    try:
+        response = supabase.table("saved_chats").insert({
+            "name": name,
+            "conversation": clean_history,
+            "facts": facts,
+        }).execute()
+        if response.data:
+            return f"Saved conversation as '{name}'."
+        return "Failed to save conversation."
+    except Exception as e:
+        return f"Save failed: {e}"
+
+def list_saved_chats() -> str:
+    if supabase is None:
+        return "Cloud storage is not configured."
+    try:
+        response = supabase.table("saved_chats").select("id, name, created_at").order("created_at", desc=True).execute()
+        if not response.data:
+            return "No saved conversations yet."
+        lines = ["Saved conversations:"]
+        for row in response.data:
+            date = row["created_at"][:10]
+            lines.append(f"  [{row['id']}] {row['name']} — {date}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"List failed: {e}"
+
+def search_saved_chats(keyword: str) -> str:
+    if supabase is None:
+        return "Cloud storage is not configured."
+    try:
+        response = supabase.table("saved_chats").select("id, name, created_at, conversation").execute()
+        if not response.data:
+            return "No saved conversations found."
+        kw = keyword.lower()
+        matches = []
+        for row in response.data:
+            if kw in row["name"].lower():
+                matches.append(row)
+                continue
+            for msg in row.get("conversation", []):
+                if kw in str(msg.get("content", "")).lower():
+                    matches.append(row)
+                    break
+        if not matches:
+            return f"No conversations matching '{keyword}'."
+        lines = [f"Matches for '{keyword}':"]
+        for row in matches:
+            date = row["created_at"][:10]
+            lines.append(f"  [{row['id']}] {row['name']} — {date}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Search failed: {e}"
+
+def load_saved_chat(identifier: str) -> dict:
+    if supabase is None:
+        return {"text": "Cloud storage is not configured.", "conversation": None}
+    try:
+        if identifier.isdigit():
+            response = supabase.table("saved_chats").select("*").eq("id", int(identifier)).execute()
+        else:
+            response = supabase.table("saved_chats").select("*").eq("name", identifier).execute()
+
+        if not response.data:
+            return {"text": f"No saved chat found matching '{identifier}'.", "conversation": None}
+
+        row = response.data[0]
+        convo = row.get("conversation", [])
+
+        preview_lines = [f"Loaded conversation '{row['name']}' (saved {row['created_at'][:10]}):", ""]
+        for m in convo[:6]:
+            role = m.get("role", "?")
+            content = str(m.get("content", ""))[:200]
+            preview_lines.append(f"  [{role}] {content}")
+        if len(convo) > 6:
+            preview_lines.append(f"  ... ({len(convo) - 6} more messages)")
+
+        return {
+            "text": "\n".join(preview_lines),
+            "conversation": convo,
+            "name": row["name"],
+        }
+    except Exception as e:
+        return {"text": f"Load failed: {e}", "conversation": None}
+
+# ================================================================
 #                        TOOLS
 # ================================================================
 
@@ -241,6 +358,32 @@ TOOLS_SPEC = [
         "description": "List files in the project folder.",
         "parameters": {"type": "object", "properties": {}, "required": []},
     }},
+    {"type": "function", "function": {
+        "name": "save_chat",
+        "description": "Store the CURRENT conversation in the database under a name. Use ONLY when the user says 'save this chat', 'save this conversation', or 'save the current chat'. Do NOT use this for 'load' requests.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "The name to save the current chat under."}
+        }, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "list_chats",
+        "description": "List all previously saved conversations. Use when the user asks to see their saved chats or history.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "search_chats",
+        "description": "Search saved conversations for a keyword. Use when the user asks to find a past conversation about something.",
+        "parameters": {"type": "object", "properties": {
+            "keyword": {"type": "string", "description": "The word or phrase to search for."}
+        }, "required": ["keyword"]},
+    }},
+    {"type": "function", "function": {
+        "name": "load_chat",
+        "description": "RETRIEVE and RESTORE a PREVIOUSLY SAVED conversation by its name or numeric ID. Use when the user says 'load the chat X', 'load chat X', 'open my saved chat X', 'restore chat X', or 'show me the full chat X'. This is the opposite of save_chat.",
+        "parameters": {"type": "object", "properties": {
+            "identifier": {"type": "string", "description": "The saved chat's name or numeric ID (e.g. '-4', '4', 'jarvis ideas')."}
+        }, "required": ["identifier"]},
+    }},
 ]
 
 APP_MAP = {
@@ -255,7 +398,7 @@ APP_MAP = {
 LOCAL_ONLY_MSG = ("This tool only works when Raphael is running on the user's "
                   "local Windows computer. It's not available in the cloud version.")
 
-def run_tool(name, args):
+def run_tool(name, args, history=None):
     try:
         if name == "get_current_time":
             return datetime.now().strftime("%A, %d %B %Y, %H:%M:%S")
@@ -310,7 +453,6 @@ def run_tool(name, args):
                 return LOCAL_ONLY_MSG
             app = args.get("app_name", "").lower().strip()
             target = APP_MAP.get(app, app)
-            print(f"[DEBUG] Opening app: {target}")
             try:
                 if target.startswith("start "):
                     subprocess.Popen(target, shell=True)
@@ -358,6 +500,23 @@ def run_tool(name, args):
             files = os.listdir(".")
             return "Files in project folder:\n" + "\n".join(f"  - {f}" for f in files)
 
+        if name == "save_chat":
+            name_arg = args.get("name", "untitled")
+            return save_chat_to_cloud(name_arg, history or [])
+
+        if name == "list_chats":
+            return list_saved_chats()
+
+        if name == "search_chats":
+            return search_saved_chats(args.get("keyword", ""))
+
+        if name == "load_chat":
+            ident = args.get("identifier", "")
+            result = load_saved_chat(ident)
+            if result.get("conversation"):
+                return f"__LOADED_CONVO__{json.dumps(result)}__END__"
+            return result["text"]
+
         return f"Unknown tool: {name}"
     except Exception as e:
         return f"Tool error: {e}"
@@ -404,6 +563,47 @@ async def process_message(message: cl.Message):
         await speak(reply)
         return
 
+    load_id = detect_load_intent(message.content)
+    if load_id:
+        print(f"[DEBUG] Pre-routed load_chat: {load_id}")
+        result = load_saved_chat(load_id)
+        if result.get("conversation"):
+            loaded = result["conversation"]
+            new_history = [{"role": "system", "content": build_system_prompt()}]
+            new_history.extend(loaded)
+            history.clear()
+            history.extend(new_history)
+            save_json(HISTORY_FILE, history)
+            print(f"[DEBUG] Loaded {len(loaded)} messages.")
+
+            if loader_msg:
+                try:
+                    await loader_msg.remove()
+                    loader_msg = None
+                except Exception:
+                    pass
+
+            reply = result["text"]
+            for token in reply.split(" "):
+                await msg.stream_token(token + " ")
+            history.append({"role": "assistant", "content": reply})
+            save_json(HISTORY_FILE, history)
+            await msg.update()
+            await speak(reply)
+            return
+        else:
+            if loader_msg:
+                try:
+                    await loader_msg.remove()
+                    loader_msg = None
+                except Exception:
+                    pass
+            reply = result["text"]
+            await msg.stream_token(reply)
+            await msg.update()
+            await speak(reply)
+            return
+
     final_text = ""
     loop_count = 0
     web_search_used = False
@@ -446,9 +646,27 @@ async def process_message(message: cl.Message):
                     })
                     continue
                 print(f"[DEBUG] Tool: {fname}({fargs})")
-                result = run_tool(fname, fargs)
+                result = run_tool(fname, fargs, history)
                 if fname == "web_search":
                     web_search_used = True
+
+                result_str = str(result)
+                if result_str.startswith("__LOADED_CONVO__"):
+                    try:
+                        payload = json.loads(result_str[len("__LOADED_CONVO__"):-len("__END__")])
+                        loaded = payload.get("conversation", [])
+                        if loaded:
+                            new_history = [{"role": "system", "content": build_system_prompt()}]
+                            new_history.extend(loaded)
+                            history.clear()
+                            history.extend(new_history)
+                            save_json(HISTORY_FILE, history)
+                            print(f"[DEBUG] Loaded {len(loaded)} messages from saved chat.")
+                            result = payload["text"]
+                    except Exception as e:
+                        print(f"[DEBUG] Failed to inject loaded convo: {e}")
+                        result = f"Load error: {e}"
+
                 history.append({
                     "role": "tool", "tool_call_id": call.id, "content": str(result),
                 })
