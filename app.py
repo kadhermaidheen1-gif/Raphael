@@ -47,11 +47,11 @@ message saying they're not available, tell the user honestly instead of
 pretending the action succeeded.
 
 Chat history tools (READ CAREFULLY — do not confuse these):
-- save_chat: STORES the current chat. Triggered by "save this chat as X".
+- archive_current_chat: STORES the current chat. Triggered by "save this chat as X".
 - list_chats: LISTS all saved chats. Triggered by "show my saved chats".
 - search_chats: SEARCHES saved chats by keyword. Triggered by "search my chats for X".
-- load_chat: RETRIEVES a saved chat and restores it. Triggered by "load the chat X", "load chat X", "open my saved chat X".
-NEVER use save_chat when the user says "load". "Load" always means load_chat.
+- load_chat: RETRIEVES a saved chat and restores it. Triggered by "load the chat X".
+NEVER use archive_current_chat when the user says "load". "Load" always means load_chat.
 """
 
 # ---------- File helpers ----------
@@ -107,26 +107,30 @@ def detect_website_intent(text: str):
     return None
 
 def detect_load_intent(text: str):
-    """Detect load/restore/show patterns and return the identifier."""
+    """If the message contains 'load' (not preceded by 'save'), route to load_chat.
+    This runs BEFORE the AI, so the AI never sees load requests."""
     t = text.lower().strip()
 
-    # Strip common leading words the user might add
     for prefix in ("hey raphael ", "raphael ", "hey ", "please ", "pls "):
         if t.startswith(prefix):
             t = t[len(prefix):].strip()
 
-    # Explicit load commands with an identifier
-    for prefix in ("load the chat ", "load chat ", "load my chat ",
-                   "restore chat ", "restore the chat ", "open the chat ",
-                   "open my chat ", "show the chat "):
-        if t.startswith(prefix):
-            identifier = t[len(prefix):].strip().strip("'\"")
-            if identifier:
-                return identifier
+    if "save" in t and "load" in t and t.index("save") < t.index("load"):
+        return None
 
-    # Standalone generic phrases
+    if "load" in t:
+        idx = t.index("load")
+        after = t[idx + len("load"):].strip()
+        for filler in ("the ", "my ", "chat ", "conversation "):
+            if after.startswith(filler):
+                after = after[len(filler):].strip()
+        after = after.strip("'\"-: ")
+        if not after:
+            return "__LAST__"
+        return after
+
     if t in ("show it fully", "show me the full chat", "show the full chat",
-             "show it all", "load it", "load it fully", "show full",
+             "show it all", "load it fully", "show fully", "show everything",
              "show me the full conversation"):
         return "__LAST__"
 
@@ -279,27 +283,36 @@ def load_saved_chat(identifier: str) -> dict:
     if supabase is None:
         return {"text": "Cloud storage is not configured.", "conversation": None}
     try:
+        response = None
         if identifier.isdigit():
             response = supabase.table("saved_chats").select("*").eq("id", int(identifier)).execute()
-        else:
+
+        if not response or not response.data:
             response = supabase.table("saved_chats").select("*").eq("name", identifier).execute()
 
-        if not response.data:
+        if not response or not response.data:
+            all_rows = supabase.table("saved_chats").select("*").order("created_at", desc=True).execute()
+            if all_rows.data:
+                for row in all_rows.data:
+                    if identifier.lower() in row["name"].lower():
+                        response = type("R", (), {"data": [row]})()
+                        break
+
+        if not response or not response.data:
             return {"text": f"No saved chat found matching '{identifier}'.", "conversation": None}
 
         row = response.data[0]
         convo = row.get("conversation", [])
 
-        preview_lines = [f"Loaded conversation '{row['name']}' (saved {row['created_at'][:10]}):", ""]
-        for m in convo[:6]:
-            role = m.get("role", "?")
-            content = str(m.get("content", ""))[:200]
-            preview_lines.append(f"  [{role}] {content}")
-        if len(convo) > 6:
-            preview_lines.append(f"  ... ({len(convo) - 6} more messages)")
+        # Clean one-line confirmation — no message dump
+        summary = (
+            f"Loaded conversation '{row['name']}' "
+            f"(saved {row['created_at'][:10]}, {len(convo)} messages). "
+            f"Context is restored — you can continue where you left off, Master."
+        )
 
         return {
-            "text": "\n".join(preview_lines),
+            "text": summary,
             "conversation": convo,
             "name": row["name"],
         }
@@ -374,7 +387,7 @@ TOOLS_SPEC = [
         "parameters": {"type": "object", "properties": {}, "required": []},
     }},
     {"type": "function", "function": {
-        "name": "save_chat",
+        "name": "archive_current_chat",
         "description": "Store the CURRENT conversation in the database under a name. Use ONLY when the user says 'save this chat', 'save this conversation', or 'save the current chat'. Do NOT use this for 'load' requests.",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "The name to save the current chat under."}
@@ -394,9 +407,9 @@ TOOLS_SPEC = [
     }},
     {"type": "function", "function": {
         "name": "load_chat",
-        "description": "RETRIEVE and RESTORE a PREVIOUSLY SAVED conversation by its name or numeric ID. Use when the user says 'load the chat X', 'load chat X', 'open my saved chat X', 'restore chat X', or 'show me the full chat X'. This is the opposite of save_chat.",
+        "description": "RETRIEVE and RESTORE a PREVIOUSLY SAVED conversation by its name or numeric ID. Use when the user says 'load the chat X', 'load chat X', 'open my saved chat X', 'restore chat X', or 'show me the full chat X'. This is the opposite of archive_current_chat.",
         "parameters": {"type": "object", "properties": {
-            "identifier": {"type": "string", "description": "The saved chat's name or numeric ID (e.g. '-4', '4', 'jarvis ideas')."}
+            "identifier": {"type": "string", "description": "The saved chat's name or numeric ID."}
         }, "required": ["identifier"]},
     }},
 ]
@@ -515,7 +528,7 @@ def run_tool(name, args, history=None):
             files = os.listdir(".")
             return "Files in project folder:\n" + "\n".join(f"  - {f}" for f in files)
 
-        if name == "save_chat":
+        if name == "archive_current_chat":
             name_arg = args.get("name", "untitled")
             return save_chat_to_cloud(name_arg, history or [])
 
