@@ -1,6 +1,7 @@
 import json
 import os
 import math
+import re
 import wave
 import platform
 import subprocess
@@ -35,26 +36,19 @@ Keep answers structured, concise, and focused on maximum efficiency.
 Tool usage rules:
 - For ANY weather question, ALWAYS use get_weather (never web_search for weather).
 - For news, current events, or general facts — use web_search ONCE, then answer.
-- To open an app (notepad, calculator, etc.) — use open_app.
-- To open a website (youtube, google, gmail, any URL) — use open_website.
-- If the user says 'open X in chrome' and X is a website, use open_website.
-- For battery, screenshots, or file listing, use the dedicated tools.
 - Do not call web_search more than once per question.
+- Do NOT try to save, load, list, or search chats — those are handled automatically.
 
-Environment note: open_app, open_website, take_screenshot, and get_battery
-only work on the user's local Windows computer. If these tools return a
-message saying they're not available, tell the user honestly instead of
-pretending the action succeeded.
-
-Chat history tools (READ CAREFULLY — do not confuse these):
-- archive_current_chat: STORES the current chat. Triggered by "save this chat as X".
-- list_chats: LISTS all saved chats. Triggered by "show my saved chats".
-- search_chats: SEARCHES saved chats by keyword. Triggered by "search my chats for X".
-- load_chat: RETRIEVES a saved chat and restores it. Triggered by "load the chat X".
-NEVER use archive_current_chat when the user says "load". "Load" always means load_chat.
+Context awareness: If you see a "[SYSTEM NOTE]" message in the history telling you
+a conversation was loaded, treat the messages above it as the current conversation
+the user is referring to. Answer questions about "that chat", "there", or "what we
+discussed" from those messages. Never save, archive, or reload in response to a question.
 """
 
-# ---------- File helpers ----------
+# ================================================================
+#                        HELPERS
+# ================================================================
+
 def load_json(path, default):
     if os.path.exists(path):
         try:
@@ -68,7 +62,10 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-# ---------- Website pre-routing ----------
+# ================================================================
+#                  DETERMINISTIC ROUTERS
+# ================================================================
+
 KNOWN_SITES = {
     "youtube": "https://www.youtube.com",
     "google": "https://www.google.com",
@@ -89,54 +86,91 @@ KNOWN_SITES = {
     "drive": "https://drive.google.com",
 }
 
-def detect_website_intent(text: str):
-    t = text.lower().strip()
-    triggers = ("open ", "go to ", "launch ", "visit ", "navigate to ")
-    if not any(t.startswith(k) or f" {k}" in t for k in triggers):
-        return None
-    for word in t.split():
-        w = word.strip(",.!?")
-        if "." in w and len(w) > 3 and not w.endswith(".exe"):
-            if w.startswith("http"):
-                return w
-            if "." in w and " " not in w:
-                return "https://" + w
-    for site, url in KNOWN_SITES.items():
-        if site in t:
-            return url
-    return None
+APP_MAP = {
+    "notepad": "notepad.exe", "chrome": "chrome.exe", "calculator": "calc.exe",
+    "explorer": "explorer.exe", "cmd": "cmd.exe", "terminal": "cmd.exe",
+    "vscode": "code", "code": "code", "spotify": "spotify.exe",
+    "word": "winword.exe", "excel": "excel.exe", "paint": "mspaint.exe",
+    "edge": "msedge.exe", "firefox": "firefox.exe",
+    "task manager": "taskmgr.exe",
+}
 
-def detect_load_intent(text: str):
-    """If the message contains 'load' (not preceded by 'save'), route to load_chat.
-    This runs BEFORE the AI, so the AI never sees load requests."""
-    t = text.lower().strip()
+def _clean_prefix(t: str) -> str:
+    """Strip leading politeness/name words."""
+    t = t.lower().strip().rstrip("?.!, ")
+    for p in ("hey raphael", "raphael", "hey", "please", "pls", "can you", "could you"):
+        if t.startswith(p + " "):
+            t = t[len(p) + 1:].strip()
+    return t
 
-    for prefix in ("hey raphael ", "raphael ", "hey ", "please ", "pls "):
-        if t.startswith(prefix):
-            t = t[len(prefix):].strip()
+def route_command(text: str):
+    """Returns (action, payload) or None. Runs BEFORE the AI."""
+    t = _clean_prefix(text)
+    original = text.strip()
 
-    if "save" in t and "load" in t and t.index("save") < t.index("load"):
-        return None
+    # ---------- SAVE ----------
+    m = re.match(r"^save (?:this )?(?:chat|conversation) as (.+)$", t)
+    if m:
+        return ("save", m.group(1).strip().strip("'\""))
 
+    # ---------- LOAD ----------
     if "load" in t:
-        idx = t.index("load")
-        after = t[idx + len("load"):].strip()
-        for filler in ("the ", "my ", "chat ", "conversation "):
-            if after.startswith(filler):
-                after = after[len(filler):].strip()
-        after = after.strip("'\"-: ")
-        if not after:
-            return "__LAST__"
-        return after
+        # don't route if "save" appears before "load"
+        if "save" not in t or t.index("save") > t.index("load"):
+            idx = t.index("load")
+            after = t[idx + 4:].strip()
+            for filler in ("the ", "my ", "chat ", "conversation "):
+                if after.startswith(filler):
+                    after = after[len(filler):].strip()
+            after = after.strip("'\"-: ")
+            return ("load", after if after else "__LAST__")
 
-    if t in ("show it fully", "show me the full chat", "show the full chat",
-             "show it all", "load it fully", "show fully", "show everything",
-             "show me the full conversation"):
-        return "__LAST__"
+    # ---------- LIST ----------
+    if any(p in t for p in (
+        "show my saved chats", "list my chats", "list chats",
+        "show saved chats", "my saved chats", "show all chats",
+        "show my chats", "list saved chats",
+    )):
+        return ("list", None)
+
+    # ---------- SEARCH ----------
+    m = re.match(r"^search (?:my )?(?:saved )?chats? (?:for )?(.+)$", t)
+    if m:
+        return ("search", m.group(1).strip().strip("'\""))
+
+    # ---------- SUMMARIZE ----------
+    if t in ("summarize", "summarize this chat", "summarize this conversation",
+             "summarise", "summary", "summarize current chat",
+             "summarize this", "give me a summary", "brief me"):
+        return ("summarize", None)
+
+    # ---------- OPEN WEBSITE ----------
+    for trigger in ("open ", "go to ", "launch ", "visit ", "navigate to "):
+        if trigger in t:
+            after = t.split(trigger, 1)[1].strip()
+            after = after.replace(" in chrome", "").replace(" in the browser", "").strip()
+            # explicit URL
+            for word in after.split():
+                w = word.strip(",.!?")
+                if "." in w and len(w) > 3 and not w.endswith(".exe"):
+                    if w.startswith("http"):
+                        return ("open_url", w)
+                    return ("open_url", "https://" + w)
+            # known site keyword
+            for site, url in KNOWN_SITES.items():
+                if site in after:
+                    return ("open_url", url)
+            # known app
+            for app in APP_MAP:
+                if after == app or after.startswith(app + " "):
+                    return ("open_app", app)
 
     return None
 
-# ---------- Long-term memory ----------
+# ================================================================
+#                    LONG-TERM MEMORY
+# ================================================================
+
 def load_long_term():
     return load_json(LONG_TERM_FILE, [])
 
@@ -185,15 +219,9 @@ async def make_spoken_summary(text: str) -> str:
             model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content":
-                 "You are a text-condensation engine. You receive a block of text "
-                 "delimited by <<< >>> markers. Your ONLY job is to rewrite that text "
-                 "as 1-2 short, natural spoken sentences. Rules:\n"
-                 "- Do NOT reply to the text.\n"
-                 "- Do NOT comment on it.\n"
-                 "- Do NOT introduce yourself.\n"
-                 "- Preserve the key fact(s).\n"
-                 "- Strip markdown, bullets, emojis, and formatting.\n"
-                 "- Return ONLY the spoken version, nothing else."},
+                 "You are a text-condensation engine. Rewrite the text between <<< >>> "
+                 "as 1-2 short, natural spoken sentences. Do NOT reply, comment, or "
+                 "introduce yourself. Strip markdown. Return ONLY the spoken version."},
                 {"role": "user", "content": f"<<<\n{text}\n>>>"},
             ],
         )
@@ -304,52 +332,44 @@ def load_saved_chat(identifier: str) -> dict:
         row = response.data[0]
         convo = row.get("conversation", [])
 
-        # Clean one-line confirmation — no message dump
         summary = (
             f"Loaded conversation '{row['name']}' "
             f"(saved {row['created_at'][:10]}, {len(convo)} messages). "
             f"Context is restored — you can continue where you left off, Master."
         )
 
-        return {
-            "text": summary,
-            "conversation": convo,
-            "name": row["name"],
-        }
+        return {"text": summary, "conversation": convo, "name": row["name"]}
     except Exception as e:
         return {"text": f"Load failed: {e}", "conversation": None}
 
+async def summarize_current_chat(history: list) -> str:
+    """Summarize the current live conversation, directly."""
+    convo = "\n".join(
+        f"{m['role']}: {m['content']}" for m in history
+        if m.get("role") != "system" and isinstance(m.get("content"), str)
+    )
+    if not convo.strip():
+        return "The current conversation is empty, Master."
+    try:
+        resp = await client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {"role": "system", "content":
+                 "You are a summarization engine. Produce a concise bulleted summary "
+                 "of the conversation below. Keep it short — key topics and decisions only. "
+                 "Do not add commentary."},
+                {"role": "user", "content": convo},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Summarize failed: {e}"
+
 # ================================================================
-#                        TOOLS
+#                    AI TOOLS (only weather + news)
 # ================================================================
 
 TOOLS_SPEC = [
-    {"type": "function", "function": {
-        "name": "get_current_time",
-        "description": "Get the current date and time.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    }},
-    {"type": "function", "function": {
-        "name": "calculate",
-        "description": "Evaluate a math expression.",
-        "parameters": {"type": "object", "properties": {
-            "expression": {"type": "string"}
-        }, "required": ["expression"]},
-    }},
-    {"type": "function", "function": {
-        "name": "read_file",
-        "description": "Read a text file in the project folder.",
-        "parameters": {"type": "object", "properties": {
-            "filename": {"type": "string"}
-        }, "required": ["filename"]},
-    }},
-    {"type": "function", "function": {
-        "name": "web_search",
-        "description": "Search the live web for news, facts, sports, prices. Not for weather.",
-        "parameters": {"type": "object", "properties": {
-            "query": {"type": "string"}
-        }, "required": ["query"], "additionalProperties": False},
-    }},
     {"type": "function", "function": {
         "name": "get_weather",
         "description": "Get current weather and 3-day forecast for a city. Defaults to Coimbatore.",
@@ -358,91 +378,16 @@ TOOLS_SPEC = [
         }, "required": []},
     }},
     {"type": "function", "function": {
-        "name": "open_app",
-        "description": "Open an application on Windows (notepad, chrome, calculator, cmd, vscode, spotify). Only works locally on the user's PC.",
+        "name": "web_search",
+        "description": "Search the live web for news, facts, sports, prices. Not for weather.",
         "parameters": {"type": "object", "properties": {
-            "app_name": {"type": "string"}
-        }, "required": ["app_name"]},
-    }},
-    {"type": "function", "function": {
-        "name": "open_website",
-        "description": "Open a website URL in Chrome. Only works locally on the user's PC.",
-        "parameters": {"type": "object", "properties": {
-            "url": {"type": "string"}
-        }, "required": ["url"]},
-    }},
-    {"type": "function", "function": {
-        "name": "get_battery",
-        "description": "Get the battery percentage and charging status. Only works locally on the user's PC.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    }},
-    {"type": "function", "function": {
-        "name": "take_screenshot",
-        "description": "Take a screenshot and save it as a PNG file. Only works locally on the user's PC.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    }},
-    {"type": "function", "function": {
-        "name": "list_files",
-        "description": "List files in the project folder.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    }},
-    {"type": "function", "function": {
-        "name": "archive_current_chat",
-        "description": "Store the CURRENT conversation in the database under a name. Use ONLY when the user says 'save this chat', 'save this conversation', or 'save the current chat'. Do NOT use this for 'load' requests.",
-        "parameters": {"type": "object", "properties": {
-            "name": {"type": "string", "description": "The name to save the current chat under."}
-        }, "required": ["name"]},
-    }},
-    {"type": "function", "function": {
-        "name": "list_chats",
-        "description": "List all previously saved conversations. Use when the user asks to see their saved chats or history.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    }},
-    {"type": "function", "function": {
-        "name": "search_chats",
-        "description": "Search saved conversations for a keyword. Use when the user asks to find a past conversation about something.",
-        "parameters": {"type": "object", "properties": {
-            "keyword": {"type": "string", "description": "The word or phrase to search for."}
-        }, "required": ["keyword"]},
-    }},
-    {"type": "function", "function": {
-        "name": "load_chat",
-        "description": "RETRIEVE and RESTORE a PREVIOUSLY SAVED conversation by its name or numeric ID. Use when the user says 'load the chat X', 'load chat X', 'open my saved chat X', 'restore chat X', or 'show me the full chat X'. This is the opposite of archive_current_chat.",
-        "parameters": {"type": "object", "properties": {
-            "identifier": {"type": "string", "description": "The saved chat's name or numeric ID."}
-        }, "required": ["identifier"]},
+            "query": {"type": "string"}
+        }, "required": ["query"], "additionalProperties": False},
     }},
 ]
 
-APP_MAP = {
-    "notepad": "notepad.exe", "chrome": "chrome.exe", "calculator": "calc.exe",
-    "explorer": "explorer.exe", "cmd": "cmd.exe", "terminal": "cmd.exe",
-    "vscode": "code", "code": "code", "spotify": "spotify.exe",
-    "word": "winword.exe", "excel": "excel.exe", "paint": "mspaint.exe",
-    "edge": "msedge.exe", "firefox": "firefox.exe",
-    "task manager": "taskmgr.exe", "settings": "start ms-settings:",
-}
-
-LOCAL_ONLY_MSG = ("This tool only works when Raphael is running on the user's "
-                  "local Windows computer. It's not available in the cloud version.")
-
-def run_tool(name, args, history=None):
+def run_tool(name, args):
     try:
-        if name == "get_current_time":
-            return datetime.now().strftime("%A, %d %B %Y, %H:%M:%S")
-
-        if name == "calculate":
-            expr = args.get("expression", "")
-            allowed = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
-            return str(eval(expr, {"__builtins__": {}}, allowed))
-
-        if name == "read_file":
-            fn = args.get("filename", "")
-            if not os.path.exists(fn):
-                return f"File not found: {fn}"
-            with open(fn, "r", encoding="utf-8") as f:
-                return f.read()[:4000]
-
         if name == "web_search":
             query = args.get("query", "")
             results = []
@@ -476,78 +421,161 @@ def run_tool(name, args, history=None):
                 lines.append(f"  {day['date']}: {desc}, {day['mintempC']}°C to {day['maxtempC']}°C")
             return "\n".join(lines)
 
-        if name == "open_app":
-            if not IS_WINDOWS:
-                return LOCAL_ONLY_MSG
-            app = args.get("app_name", "").lower().strip()
-            target = APP_MAP.get(app, app)
-            try:
-                if target.startswith("start "):
-                    subprocess.Popen(target, shell=True)
-                else:
-                    subprocess.Popen(["start", "", target], shell=True)
-                return f"Opened {app}."
-            except Exception as e:
-                return f"Failed to open {app}: {e}"
-
-        if name == "open_website":
-            if not IS_WINDOWS:
-                return LOCAL_ONLY_MSG
-            url = args.get("url", "").strip()
-            if not url.startswith("http"):
-                url = "https://" + url
-            try:
-                subprocess.Popen(["start", "chrome", url], shell=True)
-                return f"Opened {url} in Chrome."
-            except Exception as e:
-                return f"Failed to open URL: {e}"
-
-        if name == "get_battery":
-            try:
-                import psutil
-                b = psutil.sensors_battery()
-                if b is None:
-                    return "No battery detected (server has no battery)."
-                return f"Battery: {b.percent}% ({'charging' if b.power_plugged else 'on battery'})"
-            except Exception as e:
-                return f"Battery check failed: {e}"
-
-        if name == "take_screenshot":
-            if not IS_WINDOWS:
-                return LOCAL_ONLY_MSG
-            try:
-                import pyautogui
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                fn = f"screenshot_{ts}.png"
-                pyautogui.screenshot(fn)
-                return f"Screenshot saved as {fn}"
-            except Exception as e:
-                return f"Screenshot failed: {e}"
-
-        if name == "list_files":
-            files = os.listdir(".")
-            return "Files in project folder:\n" + "\n".join(f"  - {f}" for f in files)
-
-        if name == "archive_current_chat":
-            name_arg = args.get("name", "untitled")
-            return save_chat_to_cloud(name_arg, history or [])
-
-        if name == "list_chats":
-            return list_saved_chats()
-
-        if name == "search_chats":
-            return search_saved_chats(args.get("keyword", ""))
-
-        if name == "load_chat":
-            ident = args.get("identifier", "")
-            result = load_saved_chat(ident)
-            if result.get("conversation"):
-                return f"__LOADED_CONVO__{json.dumps(result)}__END__"
-            return result["text"]
-
         return f"Unknown tool: {name}"
     except Exception as e:
         return f"Tool error: {e}"
+
+# ================================================================
+#                    COMMAND EXECUTOR
+# ================================================================
+
+async def execute_route(route, payload, history, msg, loader_msg):
+    """Execute a routed command directly, no AI. Returns True if handled."""
+    action = route
+
+    async def _remove_loader():
+        if loader_msg:
+            try:
+                await loader_msg.remove()
+            except Exception:
+                pass
+
+    if action == "save":
+        result = save_chat_to_cloud(payload, history or [])
+        await _remove_loader()
+        await msg.stream_token(result)
+        history.append({"role": "assistant", "content": result})
+        save_json(HISTORY_FILE, history)
+        await msg.update()
+        await speak(result)
+        return True
+
+    if action == "load":
+        load_id = payload
+        if load_id == "__LAST__":
+            if supabase:
+                try:
+                    recent = supabase.table("saved_chats").select("id").order("created_at", desc=True).limit(1).execute()
+                    if recent.data:
+                        load_id = str(recent.data[0]["id"])
+                    else:
+                        load_id = None
+                except Exception:
+                    load_id = None
+            else:
+                load_id = None
+
+        if not load_id:
+            await _remove_loader()
+            reply = "No saved conversations found to load, Master."
+            await msg.stream_token(reply)
+            await msg.update()
+            await speak(reply)
+            return True
+
+        result = load_saved_chat(load_id)
+        if result.get("conversation"):
+            loaded = result["conversation"]
+            new_history = [{"role": "system", "content": build_system_prompt()}]
+            new_history.extend(loaded)
+            new_history.append({
+                "role": "system",
+                "content": (
+                    f"[SYSTEM NOTE] The user just loaded a saved conversation "
+                    f"titled '{result.get('name', 'unknown')}' with {len(loaded)} messages. "
+                    f"Those messages are above. If the user now asks anything about "
+                    f"'that chat', 'there', 'the loaded chat', 'what I said', 'what we discussed', "
+                    f"or similar, answer using the messages above. Do NOT save or reload."
+                ),
+            })
+            history.clear()
+            history.extend(new_history)
+            save_json(HISTORY_FILE, history)
+            print(f"[DEBUG] Loaded {len(loaded)} messages.")
+
+            await _remove_loader()
+            reply = result["text"]
+            for token in reply.split(" "):
+                await msg.stream_token(token + " ")
+            history.append({"role": "assistant", "content": reply})
+            save_json(HISTORY_FILE, history)
+            await msg.update()
+            await speak(reply)
+            return True
+        else:
+            await _remove_loader()
+            reply = result["text"]
+            await msg.stream_token(reply)
+            await msg.update()
+            await speak(reply)
+            return True
+
+    if action == "list":
+        result = list_saved_chats()
+        await _remove_loader()
+        await msg.stream_token(result)
+        history.append({"role": "assistant", "content": result})
+        save_json(HISTORY_FILE, history)
+        await msg.update()
+        await speak(result)
+        return True
+
+    if action == "search":
+        result = search_saved_chats(payload)
+        await _remove_loader()
+        await msg.stream_token(result)
+        history.append({"role": "assistant", "content": result})
+        save_json(HISTORY_FILE, history)
+        await msg.update()
+        await speak(result)
+        return True
+
+    if action == "summarize":
+        result = await summarize_current_chat(history)
+        await _remove_loader()
+        for token in result.split(" "):
+            await msg.stream_token(token + " ")
+        history.append({"role": "assistant", "content": result})
+        save_json(HISTORY_FILE, history)
+        await msg.update()
+        await speak(result)
+        return True
+
+    if action == "open_url":
+        if IS_WINDOWS:
+            subprocess.Popen(["start", "chrome", payload], shell=True)
+            reply = f"Opened {payload} in Chrome, Master."
+        else:
+            reply = ("This tool only works when Raphael is running on the user's "
+                     "local Windows computer. It's not available in the cloud version.")
+        await _remove_loader()
+        await msg.stream_token(reply)
+        history.append({"role": "assistant", "content": reply})
+        save_json(HISTORY_FILE, history)
+        await msg.update()
+        await speak(reply)
+        return True
+
+    if action == "open_app":
+        if IS_WINDOWS:
+            target = APP_MAP.get(payload, payload)
+            try:
+                subprocess.Popen(["start", "", target], shell=True)
+                reply = f"Opened {payload}."
+            except Exception as e:
+                reply = f"Failed to open {payload}: {e}"
+        else:
+            reply = ("This tool only works when Raphael is running on the user's "
+                     "local Windows computer. It's not available in the cloud version.")
+        await _remove_loader()
+        await msg.stream_token(reply)
+        history.append({"role": "assistant", "content": reply})
+        save_json(HISTORY_FILE, history)
+        await msg.update()
+        await speak(reply)
+        return True
+
+    return False
 
 # ================================================================
 #                 CORE MESSAGE PROCESSOR
@@ -570,90 +598,22 @@ async def process_message(message: cl.Message):
     except Exception as e:
         print(f"[DEBUG] Loader element failed: {e}")
 
-    direct_url = detect_website_intent(message.content)
-    if direct_url:
-        print(f"[DEBUG] Pre-routed: {direct_url}")
-        if IS_WINDOWS:
-            subprocess.Popen(["start", "chrome", direct_url], shell=True)
-            reply = f"Opened {direct_url} in Chrome, Master."
-        else:
-            reply = LOCAL_ONLY_MSG
-        if loader_msg:
-            try:
-                await loader_msg.remove()
-                loader_msg = None
-            except Exception:
-                pass
-        await msg.stream_token(reply)
-        history.append({"role": "assistant", "content": reply})
-        save_json(HISTORY_FILE, history)
-        await msg.update()
-        await speak(reply)
-        return
-
-    load_id = detect_load_intent(message.content)
-    if load_id == "__LAST__":
-        if supabase:
-            try:
-                recent = supabase.table("saved_chats").select("id").order("created_at", desc=True).limit(1).execute()
-                if recent.data:
-                    load_id = str(recent.data[0]["id"])
-                    print(f"[DEBUG] Resolved __LAST__ to chat id {load_id}")
-                else:
-                    load_id = None
-            except Exception as e:
-                print(f"[DEBUG] Failed to find recent chat: {e}")
-                load_id = None
-        else:
-            load_id = None
-
-    if load_id:
-        print(f"[DEBUG] Pre-routed load_chat: {load_id}")
-        result = load_saved_chat(load_id)
-        if result.get("conversation"):
-            loaded = result["conversation"]
-            new_history = [{"role": "system", "content": build_system_prompt()}]
-            new_history.extend(loaded)
-            history.clear()
-            history.extend(new_history)
-            save_json(HISTORY_FILE, history)
-            print(f"[DEBUG] Loaded {len(loaded)} messages.")
-
-            if loader_msg:
-                try:
-                    await loader_msg.remove()
-                    loader_msg = None
-                except Exception:
-                    pass
-
-            reply = result["text"]
-            for token in reply.split(" "):
-                await msg.stream_token(token + " ")
-            history.append({"role": "assistant", "content": reply})
-            save_json(HISTORY_FILE, history)
-            await msg.update()
-            await speak(reply)
-            return
-        else:
-            if loader_msg:
-                try:
-                    await loader_msg.remove()
-                    loader_msg = None
-                except Exception:
-                    pass
-            reply = result["text"]
-            await msg.stream_token(reply)
-            await msg.update()
-            await speak(reply)
+    # ---------- DETERMINISTIC ROUTE FIRST ----------
+    route = route_command(message.content)
+    if route:
+        print(f"[DEBUG] Routed: {route[0]} → {route[1]}")
+        handled = await execute_route(route[0], route[1], history, msg, loader_msg)
+        if handled:
             return
 
+    # ---------- AI PATH (only if no route matched) ----------
     final_text = ""
     loop_count = 0
     web_search_used = False
 
     while True:
         loop_count += 1
-        if loop_count > 4:
+        if loop_count > 3:
             final_text = "I gathered the information but couldn't compose a clean answer, Master."
             await msg.stream_token(final_text)
             break
@@ -689,27 +649,9 @@ async def process_message(message: cl.Message):
                     })
                     continue
                 print(f"[DEBUG] Tool: {fname}({fargs})")
-                result = run_tool(fname, fargs, history)
+                result = run_tool(fname, fargs)
                 if fname == "web_search":
                     web_search_used = True
-
-                result_str = str(result)
-                if result_str.startswith("__LOADED_CONVO__"):
-                    try:
-                        payload = json.loads(result_str[len("__LOADED_CONVO__"):-len("__END__")])
-                        loaded = payload.get("conversation", [])
-                        if loaded:
-                            new_history = [{"role": "system", "content": build_system_prompt()}]
-                            new_history.extend(loaded)
-                            history.clear()
-                            history.extend(new_history)
-                            save_json(HISTORY_FILE, history)
-                            print(f"[DEBUG] Loaded {len(loaded)} messages from saved chat.")
-                            result = payload["text"]
-                    except Exception as e:
-                        print(f"[DEBUG] Failed to inject loaded convo: {e}")
-                        result = f"Load error: {e}"
-
                 history.append({
                     "role": "tool", "tool_call_id": call.id, "content": str(result),
                 })
@@ -756,7 +698,8 @@ async def start():
         content=(
             "**Ultimate Skill — Raphael, Lord of Wisdom**\n\n"
             "Systems online. Analytical core engaged.\n\n"
-            "At your service, Master. How may I assist you today?"
+            "At your service, Master. How may I assist you today?\n\n"
+            "_Commands:_ save / load / list / search / summarize / open"
         )
     ).send()
 
@@ -765,8 +708,8 @@ async def start():
         actions=[
             cl.Action(name="weather", payload={"value": "weather"}, label="🌤️ Weather"),
             cl.Action(name="news",    payload={"value": "news"},    label="📰 Latest News"),
-            cl.Action(name="time",    payload={"value": "time"},    label="🕐 What time is it?"),
-            cl.Action(name="battery", payload={"value": "battery"}, label="🔋 Battery"),
+            cl.Action(name="summarize", payload={"value": "summarize"}, label="📝 Summarize"),
+            cl.Action(name="chats",   payload={"value": "list"},    label="📂 My Chats"),
         ],
     ).send()
 
@@ -778,13 +721,13 @@ async def on_weather(action: cl.Action):
 async def on_news(action: cl.Action):
     await process_message(cl.Message(content="What's the latest AI news?"))
 
-@cl.action_callback("time")
-async def on_time(action: cl.Action):
-    await process_message(cl.Message(content="What time is it?"))
+@cl.action_callback("summarize")
+async def on_summarize(action: cl.Action):
+    await process_message(cl.Message(content="summarize this chat"))
 
-@cl.action_callback("battery")
-async def on_battery(action: cl.Action):
-    await process_message(cl.Message(content="What's my battery?"))
+@cl.action_callback("chats")
+async def on_chats(action: cl.Action):
+    await process_message(cl.Message(content="show my saved chats"))
 
 @cl.on_message
 async def main(message: cl.Message):
